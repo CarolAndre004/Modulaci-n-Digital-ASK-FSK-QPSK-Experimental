@@ -1,5 +1,4 @@
 
-
 import numpy as np
 import matplotlib.pyplot as plt
 import adi
@@ -11,7 +10,8 @@ from scipy import signal
 # ==========================================
 def generar_pn9(longitud=510):
     """
-    Genera secuencia PN-9 par (510 bits = 255 símbolos QPSK).
+    Genera secuencia PN-9. Para QPSK necesitamos un número PAR de bits
+    para poder agruparlos de 2 en 2 sin que sobre ninguno (510 bits = 255 símbolos).
     """
     registro = [1] * 9
     bits = []
@@ -24,33 +24,38 @@ def generar_pn9(longitud=510):
 # ==========================================
 # 2. MODULADOR QPSK Y MAPEO DE CONSTELACIÓN
 # ==========================================
-print("1. Generando secuencia PN-9 y mapeando a símbolos QPSK...")
+print("1. Generando secuencia PN-9 (Par) y agrupar en símbolos QPSK...")
 bits_tx = generar_pn9(510)
 muestras_por_simbolo = 100
 
+# Agrupamos los bits de 2 en 2: (bit_par, bit_impar)
 simbolos_tx = []
 for i in range(0, len(bits_tx), 2):
     b1 = bits_tx[i]
     b2 = bits_tx[i+1]
+    # Mapeo a los 4 ángulos de fase (Cuadrantes I/Q con amplitud 1.0)
     if b1 == 0 and b2 == 0:
-        simbolos_tx.append(np.exp(1j * np.pi / 4))       # 45°  (+I, +Q)
+        simbolos_tx.append(np.exp(1j * np.pi / 4))       # 45 grados  (+I, +Q)
     elif b1 == 0 and b2 == 1:
-        simbolos_tx.append(np.exp(1j * 3 * np.pi / 4))   # 135° (-I, +Q)
+        simbolos_tx.append(np.exp(1j * 3 * np.pi / 4))   # 135 grados (-I, +Q)
     elif b1 == 1 and b2 == 1:
-        simbolos_tx.append(np.exp(1j * 5 * np.pi / 4))   # 225° (-I, -Q)
+        simbolos_tx.append(np.exp(1j * 5 * np.pi / 4))   # 225 grados (-I, -Q)
     elif b1 == 1 and b2 == 0:
-        simbolos_tx.append(np.exp(1j * 7 * np.pi / 4))   # 315° (+I, -Q)
+        simbolos_tx.append(np.exp(1j * 7 * np.pi / 4))   # 315 grados (+I, -Q)
 
 simbolos_tx = np.array(simbolos_tx)
+
+# Aplicamos sobremuestreo para que el hardware transmita pulsos continuos
 senal_qpsk_tx = np.repeat(simbolos_tx, muestras_por_simbolo)
 
+# Escalamos al rango del DAC de 16 bits del ADALM-Pluto
 escala_dac = 2**14
 senal_tx_compleja = (senal_qpsk_tx * escala_dac).astype(np.complex64)
 
 # ==========================================
 # 3. CONFIGURACIÓN DEL ADALM-PLUTO (Fase B)
 # ==========================================
-print("2. Configurando ADALM-Pluto SDR (Modo Inalámbrico)...")
+print("2. Configurando ADALM-Pluto SDR (Modo Inalámbrico con Antenas)...")
 try:
     sdr = adi.Pluto('ip:192.168.2.1')
 except Exception as e:
@@ -61,6 +66,7 @@ sdr.sample_rate = int(1e6)          # 1 Msps
 sdr.tx_lo = int(915e6)              # 915 MHz
 sdr.rx_lo = int(915e6)              # 915 MHz
 
+# Ganancias equilibradas
 sdr.tx_hardwaregain_chan0 = -40     
 sdr.rx_hardwaregain_chan0 = 20      
 
@@ -69,80 +75,66 @@ sdr.tx_cyclic_buffer = True
 
 print("3. Transmitiendo QPSK y capturando del aire...")
 sdr.tx(senal_tx_compleja)
-time.sleep(1)
+time.sleep(1) # Estabilización de RF
 
-for _ in range(5): _ = sdr.rx() 
+for _ in range(5): _ = sdr.rx() # Limpiar búfer viejo
 senal_rx_compleja = sdr.rx()
 
+# Normalizamos la amplitud general para compensar pérdidas del aire
 senal_rx_norm = senal_rx_compleja / np.mean(np.abs(senal_rx_compleja))
 
 # ==========================================
-# 4. SINCRONIZACIÓN Y CORRECCIÓN DE FASE (Fase C)
+# 4. SINCRONIZACIÓN Y DEMODULACIÓN QPSK (Fase C)
 # ==========================================
-print("4. Sincronizando en tiempo...")
+print("4. Sincronizando secuencia en el tiempo...")
+# Correlación usando la magnitud de los saltos de fase
 correlacion = signal.correlate(np.abs(np.diff(senal_rx_norm)), np.abs(np.diff(senal_qpsk_tx)), mode='valid')
 indice_inicio = np.argmax(correlacion)
+
 rx_sinc = senal_rx_norm[indice_inicio : indice_inicio + len(senal_qpsk_tx)]
 
-# Muestreo óptimo en el centro del símbolo
-simbolos_rx_crudos = []
+# Extraemos 1 sola muestra por símbolo justo en el centro (Muestreo óptimo)
+simbolos_rx = []
 for i in range(len(simbolos_tx)):
     centro = int((i + 0.5) * muestras_por_simbolo)
-    simbolos_rx_crudos.append(rx_sinc[centro])
-simbolos_rx_crudos = np.array(simbolos_rx_crudos)
+    simbolos_rx.append(rx_sinc[centro])
 
-print("5. Estimando y corrigiendo rotación de fase (4to Orden)...")
-# ESTIMADOR DE FASE DE 4TO ORDEN:
-# Al elevar a la 4ta potencia, eliminamos la modulación QPSK y dejamos solo el error de ángulo
-simbolos_a_la_cuarta = simbolos_rx_crudos ** 4
-angulo_error_cuadruple = np.angle(np.mean(simbolos_a_la_cuarta))
-# Dividimos entre 4 y ajustamos el signo porque la constelación teórica está en 45° (pi/4)
-error_fase_estimado = (angulo_error_cuadruple - np.pi) / 4.0
+simbolos_rx = np.array(simbolos_rx)
 
-# Giremos la constelación matemáticamente para alinearla
-simbolos_rx = simbolos_rx_crudos * np.exp(-1j * error_fase_estimado)
-
-# Resolución de ambigüedad de cuadrante (90 grados) mediante prueba rápida de BER
-mejor_ber = 1.0
-mejor_rotacion = simbolos_rx
-bits_finales = []
-
-for rot in [0, np.pi/2, np.pi, 3*np.pi/2]:
-    sims_prueba = simbolos_rx * np.exp(1j * rot)
-    bits_prueba = []
-    for s in sims_prueba:
-        I, Q = np.real(s), np.imag(s)
-        if I >= 0 and Q >= 0: bits_prueba.extend([0, 0])
-        elif I < 0 and Q >= 0: bits_prueba.extend([0, 1])
-        elif I < 0 and Q < 0: bits_prueba.extend([1, 1])
-        elif I >= 0 and Q < 0: bits_prueba.extend([1, 0])
+print("5. Demodulando por decisión de cuadrantes I/Q...")
+bits_rx = []
+for s in simbolos_rx:
+    # Evaluamos el signo de la parte Real (I) e Imaginaria (Q)
+    I = np.real(s)
+    Q = np.imag(s)
     
-    ber_prueba = np.sum(bits_tx != np.array(bits_prueba)) / len(bits_tx)
-    if ber_prueba < mejor_ber:
-        mejor_ber = ber_prueba
-        mejor_rotacion = sims_prueba
-        bits_finales = bits_prueba
+    if I >= 0 and Q >= 0:
+        bits_rx.extend([0, 0]) # Cuadrante 1
+    elif I < 0 and Q >= 0:
+        bits_rx.extend([0, 1]) # Cuadrante 2
+    elif I < 0 and Q < 0:
+        bits_rx.extend([1, 1]) # Cuadrante 3
+    elif I >= 0 and Q < 0:
+        bits_rx.extend([1, 0]) # Cuadrante 4
 
-simbolos_rx = mejor_rotacion
-bits_rx = np.array(bits_finales)
-ber = mejor_ber
+bits_rx = np.array(bits_rx)
 
 # ==========================================
 # 5. CÁLCULO DE BER (Fase D)
 # ==========================================
 errores = np.sum(bits_tx != bits_rx)
+ber = errores / len(bits_tx)
 
 print("\n" + "="*50)
 print(" RESULTADOS DE DEMODULACIÓN QPSK (Fase C & D)")
 print("="*50)
-print(f"  Error de fase detectado en hardware: {np.degrees(error_fase_estimado):.2f}°")
-print(f"  Total de bits evaluados (PN-9):      {len(bits_tx)} bits ({len(simbolos_tx)} símbolos)")
-print(f"  Bits erróneos recibidos:             {errores}")
-print(f"  TASA DE ERROR DE BIT (BER):          {ber:.6f}")
+print(f"  Total de bits evaluados (PN-9):  {len(bits_tx)} bits ({len(simbolos_tx)} símbolos)")
+print(f"  Bits erróneos recibidos:         {errores}")
+print(f"  TASA DE ERROR DE BIT (BER):      {ber:.6f}")
 if ber < 1e-3:
     print("  ESTADO: ¡CUMPLE ESPECIFICACIÓN IEEE! (BER < 1e-3)")
 else:
-    print("  ESTADO: Revisa la alineación final.")
+    print("  ESTADO: Desfase de portadora detectado. Revisa la constelación.")
 print("="*50 + "\n")
 
 # ==========================================
@@ -150,18 +142,20 @@ print("="*50 + "\n")
 # ==========================================
 plt.figure(figsize=(14, 6))
 
+# Subgráfica 1: El famoso Diagrama de Constelación I/Q
 plt.subplot(1, 2, 1)
-plt.scatter(np.real(simbolos_rx), np.imag(simbolos_rx), c='red', alpha=0.6, label='Símbolos RX (Corregidos)')
+plt.scatter(np.real(simbolos_rx), np.imag(simbolos_rx), c='red', alpha=0.6, label='Símbolos RX (Aire)')
 plt.scatter(np.real(simbolos_tx), np.imag(simbolos_tx), c='blue', marker='x', s=100, linewidths=3, label='Símbolos TX (Ideales)')
 plt.axhline(0, color='black', linestyle='--', alpha=0.5)
 plt.axvline(0, color='black', linestyle='--', alpha=0.5)
-plt.title(f'Constelación QPSK Alineada | BER = {ber:.4f}')
+plt.title(f'Constelación QPSK (Plano I/Q) | BER = {ber:.4f}')
 plt.xlabel('Componente en Fase (I)')
 plt.ylabel('Componente en Cuadratura (Q)')
 plt.grid(True, linestyle=':', alpha=0.6)
 plt.legend(loc='upper right')
-plt.axis('equal')
+plt.axis('equal') # Mantener proporción cuadrada exacta
 
+# Subgráfica 2: Comparativa temporal de los primeros 30 bits (15 símbolos)
 bits_ver = 30
 muestras_ver = bits_ver * int(muestras_por_simbolo / 2)
 tiempo = np.arange(muestras_ver) / sdr.sample_rate * 1000
@@ -179,5 +173,6 @@ plt.legend(loc='upper right')
 plt.tight_layout()
 plt.show()
 
+# Liberación obligatoria de memoria
 sdr.tx_destroy_buffer()
 print("Memoria del ADALM-Pluto liberada correctamente.")
